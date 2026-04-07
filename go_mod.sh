@@ -1,5 +1,9 @@
 #!/bin/bash
 
+cd consul
+go mod tidy
+cd ..
+
 cd cron
 go mod tidy
 cd ..
