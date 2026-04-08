@@ -1,9 +1,11 @@
 package consul
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	cfacade "github.com/cherry-game/cherry/facade"
@@ -12,18 +14,43 @@ import (
 	cproto "github.com/cherry-game/cherry/net/proto"
 	cprofile "github.com/cherry-game/cherry/profile"
 	consulapi "github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/api/watch"
 	jsoniter "github.com/json-iterator/go"
 )
+
+const (
+	communicationHTTP = "http"
+	communicationGRPC = "grpc"
+	communicationDNS  = "dns"
+)
+
+type serviceMemberProvider interface {
+	ListMembers(ctx context.Context) ([]*cproto.Member, error)
+	Close() error
+}
+
+func getAddressWithPort(address string, port int) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
 
 // Consul consul方式发现服务
 type Consul struct {
 	app cfacade.IApplication
 	cdiscovery.DiscoveryDefault
-	prefix string
-	config *consulapi.Config
-	ttl    int64
-	cli    *consulapi.Client // consul client
+	prefix         string
+	config         *consulapi.Config
+	ttl            int64
+	communication  string
+	watchInterval  time.Duration
+	dnsDomain      string
+	dnsAddress     string
+	grpcAddress    string
+	cli            *consulapi.Client
+	memberProvider serviceMemberProvider
 }
 
 func New() *Consul {
@@ -57,6 +84,12 @@ func (p *Consul) OnStop() {
 	serviceID := p.app.NodeID()
 	err := p.cli.Agent().ServiceDeregister(serviceID)
 	clog.Infof("consul stopping! deregister service err = %v", err)
+
+	if p.memberProvider != nil {
+		if closeErr := p.memberProvider.Close(); closeErr != nil {
+			clog.Warnf("consul provider close error: %v", closeErr)
+		}
+	}
 }
 
 func (p *Consul) loadConfig(config cfacade.ProfileJSON) {
@@ -71,6 +104,14 @@ func (p *Consul) loadConfig(config cfacade.ProfileJSON) {
 
 	p.ttl = config.GetInt64("ttl", 5)
 	p.prefix = config.GetString("prefix", "cherry")
+	p.communication = strings.ToLower(config.GetString("communication", communicationHTTP))
+	p.watchInterval = time.Duration(config.GetInt64("watch_interval_ms", 1000)) * time.Millisecond
+	if p.watchInterval < 200*time.Millisecond {
+		p.watchInterval = 200 * time.Millisecond
+	}
+	p.dnsDomain = config.GetString("dns_domain", "service.consul")
+	p.dnsAddress = config.GetString("dns_address", getAddressWithPort(p.config.Address, 8600))
+	p.grpcAddress = config.GetString("grpc_address", getAddressWithPort(p.config.Address, 8502))
 }
 
 func (p *Consul) init() {
@@ -157,65 +198,74 @@ func (p *Consul) keepAlive() {
 }
 
 func (p *Consul) watch() {
-	plan, err := watch.Parse(map[string]interface{}{
-		"type":    "service",
-		"service": p.prefix,
-	})
+	var err error
+	p.memberProvider, err = p.newMemberProvider()
 	if err != nil {
-		clog.Fatalf("consul watch parse error: %v", err)
+		clog.Fatalf("consul member provider init error: %v", err)
 		return
 	}
 
-	plan.Handler = func(idx uint64, data interface{}) {
-		entries, ok := data.([]*consulapi.ServiceEntry)
-		if !ok {
-			return
-		}
-
-		currentNodes := make(map[string]bool)
-
-		for _, entry := range entries {
-			// filter by health check
-			passing := true
-			for _, check := range entry.Checks {
-				if check.Status != consulapi.HealthPassing {
-					passing = false
-					break
+	p.syncMembers()
+	ticker := time.NewTicker(p.watchInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				p.syncMembers()
+			case die := <-p.app.DieChan():
+				if die {
+					return
 				}
 			}
-			if !passing {
-				continue
-			}
+		}
+	}()
+}
 
-			memberStr, ok := entry.Service.Meta["member"]
-			if !ok {
-				continue
-			}
+func (p *Consul) newMemberProvider() (serviceMemberProvider, error) {
+	switch p.communication {
+	case communicationGRPC:
+		return newGRPCMemberProvider(p.prefix, p.dnsDomain, p.grpcAddress)
+	case communicationDNS:
+		return &dnsMemberProvider{
+			prefix:     p.prefix,
+			domain:     p.dnsDomain,
+			dnsAddress: p.dnsAddress,
+		}, nil
+	default:
+		p.communication = communicationHTTP
+		return &httpMemberProvider{
+			cli:    p.cli,
+			prefix: p.prefix,
+		}, nil
+	}
+}
 
-			member := &cproto.Member{}
-			err := jsoniter.UnmarshalFromString(memberStr, member)
-			if err != nil {
-				continue
-			}
+func (p *Consul) syncMembers() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-			currentNodes[member.NodeID] = true
+	members, err := p.memberProvider.ListMembers(ctx)
+	if err != nil {
+		clog.Warnf("consul sync members error: %v", err)
+		return
+	}
 
-			if _, found := p.GetMember(member.NodeID); !found {
-				p.AddMember(member)
-			}
+	currentNodes := make(map[string]bool, len(members))
+	for _, member := range members {
+		if member == nil || member.NodeID == "" {
+			continue
 		}
 
-		// Remove stale nodes
-		for nodeID := range p.Map() {
-			if !currentNodes[nodeID] {
-				p.RemoveMember(nodeID)
-			}
+		currentNodes[member.NodeID] = true
+		if _, found := p.GetMember(member.NodeID); !found {
+			p.AddMember(member)
 		}
 	}
 
-	go func() {
-		if err := plan.Run(p.config.Address); err != nil {
-			clog.Fatalf("consul watch run error: %v", err)
+	for nodeID := range p.Map() {
+		if !currentNodes[nodeID] {
+			p.RemoveMember(nodeID)
 		}
-	}()
+	}
 }

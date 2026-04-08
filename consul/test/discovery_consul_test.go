@@ -162,7 +162,72 @@ func TestConsulDiscovery_RegisterAndDeregister(t *testing.T) {
 	}
 }
 
+func TestConsulDiscovery_RegisterAndDeregister_CommunicationModes(t *testing.T) {
+	address := "127.0.0.1:8500"
+	cli, err := consulapi.NewClient(&consulapi.Config{Address: address})
+	if err != nil {
+		t.Fatalf("create consul client failed: %v", err)
+	}
+
+	if _, err = cli.Agent().Self(); err != nil {
+		t.Skipf("consul is unavailable at %s: %v", address, err)
+	}
+
+	modes := []string{"http", "dns", "grpc", "invalid-mode"}
+	for _, mode := range modes {
+		t.Run(mode, func(t *testing.T) {
+			nodeID := fmt.Sprintf("consul-test-%s-%d", mode, time.Now().UnixNano())
+			prefix := fmt.Sprintf("cherry-test-%s-%d", mode, time.Now().UnixNano())
+			rpcAddress := "127.0.0.1:19091"
+			nodeType := "gateway"
+
+			profilePath, profileErr := createProfileFileWithCommunication(nodeID, nodeType, rpcAddress, address, prefix, mode)
+			if profileErr != nil {
+				t.Fatalf("create profile file failed: %v", profileErr)
+			}
+
+			if _, profileErr = cprofile.Init(profilePath, nodeID); profileErr != nil {
+				t.Fatalf("init profile failed: %v", profileErr)
+			}
+
+			app := newMockApplication(nodeID, nodeType, rpcAddress)
+			discovery := cherryConsul.New()
+			discovery.Load(app)
+			defer stopDiscovery(discovery, app)
+
+			if profileErr = waitUntil(5*time.Second, func() (bool, error) {
+				svc, _, serviceErr := cli.Agent().Service(nodeID, nil)
+				if serviceErr != nil {
+					return false, serviceErr
+				}
+				return svc != nil, nil
+			}); profileErr != nil {
+				t.Fatalf("service register check failed: %v", profileErr)
+			}
+
+			stopDiscovery(discovery, app)
+
+			if profileErr = waitUntil(5*time.Second, func() (bool, error) {
+				svc, _, serviceErr := cli.Agent().Service(nodeID, nil)
+				if serviceErr != nil {
+					if strings.Contains(strings.ToLower(serviceErr.Error()), "unknown service id") {
+						return true, nil
+					}
+					return false, serviceErr
+				}
+				return svc == nil, nil
+			}); profileErr != nil {
+				t.Fatalf("service deregister check failed: %v", profileErr)
+			}
+		})
+	}
+}
+
 func createProfileFile(nodeID, nodeType, rpcAddress, consulAddress, prefix string) (string, error) {
+	return createProfileFileWithCommunication(nodeID, nodeType, rpcAddress, consulAddress, prefix, "http")
+}
+
+func createProfileFileWithCommunication(nodeID, nodeType, rpcAddress, consulAddress, prefix, communication string) (string, error) {
 	dir, err := os.MkdirTemp("", "consul-profile-*")
 	if err != nil {
 		return "", err
@@ -187,10 +252,13 @@ func createProfileFile(nodeID, nodeType, rpcAddress, consulAddress, prefix strin
     "consul": {
       "address": "%s",
       "ttl": 3,
-      "prefix": "%s"
+      "prefix": "%s",
+      "communication": "%s",
+      "dns_address": "127.0.0.1:8600",
+      "grpc_address": "127.0.0.1:8502"
     }
   }
-}`, nodeType, nodeID, rpcAddress, consulAddress, prefix)
+}`, nodeType, nodeID, rpcAddress, consulAddress, prefix, communication)
 
 	filePath := filepath.Join(dir, "profile-test.json")
 	if err = os.WriteFile(filePath, []byte(content), 0o644); err != nil {
